@@ -1,0 +1,42 @@
+server:
+  port: 8091
+
+spring:
+  application:
+    name: stream-task-demo
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics
+
+stream-task:
+  enabled: true
+  namespace: demo
+  group: stream-task-demo-group
+  consumer:
+    enabled: true
+    name: ${spring.application.name}-${random.uuid}
+    batch-size: 10
+    block-timeout: 2s
+  retry:
+    max-attempts: 3
+  recovery:
+    enabled: true
+    scan-interval: 5s
+    min-idle-time: 10s
+    claim-batch-size: 20
+  idempotent:
+    enabled: true
+    lease-time: 120s
+    renew-interval: 30s
+    done-ttl: 7d
+  metrics:
+    enabled: true
+  admin:
+    enabled: true

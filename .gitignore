@@ -1,0 +1,54 @@
+plan/
+
+# Maven / Java build output
+target/
+**/target/
+*.class
+*.jar
+*.war
+*.ear
+
+# Test and coverage output
+surefire-reports/
+failsafe-reports/
+jacoco.exec
+coverage/
+
+# Local runtime files
+logs/
+*.log
+*.pid
+*.hprof
+hs_err_pid*
+replay_pid*
+
+# Local environment
+.env
+.env.*
+!.env.example
+application-local.yml
+application-local.yaml
+application-*.local.yml
+application-*.local.yaml
+
+# IDE / editor
+.idea/
+*.iml
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+~$*
