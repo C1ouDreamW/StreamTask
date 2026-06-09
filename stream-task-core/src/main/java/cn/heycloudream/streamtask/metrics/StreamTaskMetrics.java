@@ -28,6 +28,14 @@ public class StreamTaskMetrics {
         registry.counter("stream.task.dlq", "task.type", taskType).increment();
     }
 
+    public void malformed() {
+        registry.counter("stream.task.malformed").increment();
+    }
+
+    public void leaseLost(String taskType) {
+        registry.counter("stream.task.lease.lost", "task.type", taskType).increment();
+    }
+
     public void execution(String taskType, String status, Duration duration) {
         Timer.builder("stream.task.execution")
                 .tag("task.type", taskType)

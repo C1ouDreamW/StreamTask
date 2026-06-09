@@ -6,7 +6,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.SmartLifecycle;
 
-import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -57,10 +56,14 @@ public class PendingRecoveryScheduler implements SmartLifecycle {
 
     public void scanOnce() {
         try {
-            List<ClaimedStreamRecord> records = claimer.autoClaim(recoveryConsumer());
-            for (ClaimedStreamRecord record : records) {
-                executor.execute(record.messageId(), record.body(), recoveryConsumer());
-            }
+            String cursor = "0-0";
+            do {
+                AutoClaimResult result = claimer.autoClaim(recoveryConsumer(), cursor);
+                cursor = result.nextStartId();
+                for (ClaimedStreamRecord record : result.records()) {
+                    executor.execute(record.messageId(), record.body(), recoveryConsumer());
+                }
+            } while (!"0-0".equals(cursor) && running.get());
         } catch (Exception e) {
             log.warn("[StreamTask] pending recovery failed", e);
         }

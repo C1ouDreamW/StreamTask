@@ -24,6 +24,14 @@ public class NoopStreamTaskMetrics extends StreamTaskMetrics {
     }
 
     @Override
+    public void malformed() {
+    }
+
+    @Override
+    public void leaseLost(String taskType) {
+    }
+
+    @Override
     public void execution(String taskType, String status, Duration duration) {
     }
 }

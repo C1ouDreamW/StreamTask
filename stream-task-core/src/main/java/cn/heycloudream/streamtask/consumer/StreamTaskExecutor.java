@@ -61,7 +61,13 @@ public class StreamTaskExecutor {
     }
 
     public void execute(String messageId, Map<Object, Object> raw, String consumerName) {
-        StreamTaskEnvelope task = serializer.fromMap(raw);
+        StreamTaskEnvelope task;
+        try {
+            task = deserialize(raw);
+        } catch (MalformedTaskException error) {
+            handleMalformedMessage(messageId, raw, error, consumerName);
+            return;
+        }
         int attempt = attemptRepository.increment(messageId);
         Instant startedAt = Instant.now();
         Lease lease = null;
@@ -86,7 +92,10 @@ public class StreamTaskExecutor {
             watchdog = leaseWatchdog.watch(lease);
             StreamTaskHandler handler = handlerRegistry.getRequired(task.taskType());
             handler.handle(task);
-            idempotentGuard.markDone(lease);
+            boolean marked = idempotentGuard.markDone(lease);
+            if (!marked) {
+                throw new LeaseLostException("lease lost before task completion");
+            }
             ack(messageId);
             attemptRepository.reset(messageId);
             metrics.consumed(task.taskType(), "success");
@@ -98,6 +107,14 @@ public class StreamTaskExecutor {
                 idempotentGuard.release(lease);
             }
             attemptRepository.recordError(messageId, error);
+            if (error instanceof LeaseLostException) {
+                metrics.consumed(task.taskType(), "lease_lost");
+                metrics.leaseLost(task.taskType());
+                metrics.execution(task.taskType(), "lease_lost", Duration.between(startedAt, Instant.now()));
+                log.warn("[StreamTask] lease lost before ack messageId={} taskType={} businessKey={} attempt={} consumer={}",
+                        messageId, task.taskType(), task.businessKey(), attempt, consumerName);
+                return;
+            }
             metrics.consumed(task.taskType(), "failed");
             metrics.execution(task.taskType(), "failed", Duration.between(startedAt, Instant.now()));
             log.warn("[StreamTask] failed messageId={} taskType={} businessKey={} attempt={} consumer={} error={}",
@@ -106,9 +123,9 @@ public class StreamTaskExecutor {
                 Throwable dlqError = error instanceof MaxAttemptsExceededException
                         ? error
                         : new MaxAttemptsExceededException("max attempts exceeded: " + error.getMessage());
-                deadLetterService.write(deadLetterService.fromFailure(messageId, task, attempt, dlqError, consumerName));
-                ack(messageId);
-                attemptRepository.reset(messageId);
+                deadLetterService.moveToDeadLetterAtomically(
+                        deadLetterService.fromFailure(messageId, task, attempt, dlqError, consumerName)
+                );
                 log.warn("[StreamTask] moved to DLQ messageId={} taskType={} businessKey={} attempt={} consumer={}",
                         messageId, task.taskType(), task.businessKey(), attempt, consumerName);
             } else {
@@ -119,6 +136,36 @@ public class StreamTaskExecutor {
                 watchdog.cancel(false);
             }
         }
+    }
+
+    private StreamTaskEnvelope deserialize(Map<Object, Object> raw) {
+        try {
+            StreamTaskEnvelope task = serializer.fromMap(raw);
+            if (task.taskType() == null || task.taskType().isBlank()) {
+                throw new MalformedTaskException("taskType is required");
+            }
+            if (task.businessKey() == null || task.businessKey().isBlank()) {
+                throw new MalformedTaskException("businessKey is required");
+            }
+            return task;
+        } catch (MalformedTaskException error) {
+            throw error;
+        } catch (RuntimeException error) {
+            throw new MalformedTaskException("invalid stream task payload", error);
+        }
+    }
+
+    private void handleMalformedMessage(
+            String messageId,
+            Map<Object, Object> raw,
+            MalformedTaskException error,
+            String consumerName
+    ) {
+        deadLetterService.moveToDeadLetterAtomically(
+                deadLetterService.fromMalformed(messageId, raw, error, consumerName)
+        );
+        log.warn("[StreamTask] malformed message moved to DLQ messageId={} consumer={} error={}",
+                messageId, consumerName, error.getMessage());
     }
 
     private void ack(String messageId) {

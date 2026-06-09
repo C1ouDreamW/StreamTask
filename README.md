@@ -24,6 +24,7 @@ docker compose up -d redis
 启动 Demo：
 
 ```bash
+mvn clean install -DskipTests
 mvn -pl stream-task-demo spring-boot:run
 ```
 

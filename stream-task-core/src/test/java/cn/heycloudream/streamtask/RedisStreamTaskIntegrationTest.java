@@ -10,6 +10,8 @@ import cn.heycloudream.streamtask.metrics.NoopStreamTaskMetrics;
 import cn.heycloudream.streamtask.model.StreamTaskEnvelope;
 import cn.heycloudream.streamtask.producer.RedisStreamTaskTemplate;
 import cn.heycloudream.streamtask.recovery.AttemptRepository;
+import cn.heycloudream.streamtask.recovery.AutoClaimResult;
+import cn.heycloudream.streamtask.recovery.PendingMessageClaimer;
 import cn.heycloudream.streamtask.support.StreamTaskEnvelopeValidator;
 import cn.heycloudream.streamtask.support.StreamTaskProperties;
 import cn.heycloudream.streamtask.support.StreamTaskSerializer;
@@ -30,7 +32,11 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -122,6 +128,66 @@ class RedisStreamTaskIntegrationTest {
         assertThat(redisTemplate.opsForStream().pending(properties.mainStreamKey(), properties.getGroup()).getTotalPendingMessages())
                 .isZero();
         assertThat(redisTemplate.opsForStream().size(properties.dlqStreamKey())).isEqualTo(1);
+        assertThat(redisTemplate.opsForHash().hasKey(properties.attemptsKey(), recordId())).isFalse();
+        assertThat(redisTemplate.opsForHash().hasKey(properties.lastErrorKey(), recordId())).isFalse();
+    }
+
+    @Test
+    void malformedMessageMovesToDlqAndAcknowledges() {
+        StreamTaskExecutor executor = executor(task -> {
+            throw new AssertionError("malformed messages must not reach handler");
+        });
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("businessKey", "broken-biz");
+        fields.put("payload", "{}");
+        redisTemplate.opsForStream().add(properties.mainStreamKey(), fields);
+
+        executor.execute(readOne(), properties.getConsumer().getName());
+
+        assertThat(redisTemplate.opsForStream().pending(properties.mainStreamKey(), properties.getGroup()).getTotalPendingMessages())
+                .isZero();
+        List<MapRecord<String, Object, Object>> dlqRecords = redisTemplate.opsForStream()
+                .range(properties.dlqStreamKey(), org.springframework.data.domain.Range.unbounded());
+        assertThat(dlqRecords).hasSize(1);
+        assertThat(dlqRecords.get(0).getValue())
+                .containsEntry("malformed", "true")
+                .containsEntry("businessKey", "broken-biz");
+    }
+
+    @Test
+    void shouldNotAckWhenLeaseIsLostBeforeMarkDone() {
+        StreamTaskExecutor executor = executor(task ->
+                redisTemplate.delete(properties.idempotentKey(task.taskType(), task.businessKey()))
+        );
+        template.publish("demo.success", "lost-lease", "{}");
+
+        executor.execute(readOne(), properties.getConsumer().getName());
+
+        assertThat(redisTemplate.opsForStream().pending(properties.mainStreamKey(), properties.getGroup()).getTotalPendingMessages())
+                .isEqualTo(1);
+        assertThat(redisTemplate.opsForStream().size(properties.dlqStreamKey())).isEqualTo(0);
+    }
+
+    @Test
+    void shouldScanAllPendingMessagesAcrossMultipleAutoClaimPages() throws InterruptedException {
+        properties.getRecovery().setMinIdleTime(Duration.ofMillis(1));
+        properties.getRecovery().setClaimBatchSize(2);
+        for (int i = 0; i < 5; i++) {
+            template.publish("demo.success", "biz-" + i, "{}");
+        }
+        read(5, "crashed-consumer");
+        Thread.sleep(20);
+
+        PendingMessageClaimer claimer = new PendingMessageClaimer(redisTemplate, properties);
+        Set<String> claimedIds = new LinkedHashSet<>();
+        String cursor = "0-0";
+        do {
+            AutoClaimResult result = claimer.autoClaim("recovery-consumer", cursor);
+            cursor = result.nextStartId();
+            result.records().forEach(record -> claimedIds.add(record.messageId()));
+        } while (!"0-0".equals(cursor));
+
+        assertThat(claimedIds).hasSize(5);
     }
 
     @Test
@@ -161,13 +227,26 @@ class RedisStreamTaskIntegrationTest {
     }
 
     private List<MapRecord<String, Object, Object>> read(int count) {
+        return read(count, properties.getConsumer().getName());
+    }
+
+    private List<MapRecord<String, Object, Object>> read(int count, String consumerName) {
         List<MapRecord<String, Object, Object>> records = redisTemplate.opsForStream().read(
-                Consumer.from(properties.getGroup(), properties.getConsumer().getName()),
+                Consumer.from(properties.getGroup(), consumerName),
                 StreamReadOptions.empty().count(count).block(Duration.ofSeconds(1)),
                 StreamOffset.create(properties.mainStreamKey(), ReadOffset.lastConsumed())
         );
         assertThat(records).isNotNull().hasSize(count);
         return records;
+    }
+
+    private String recordId() {
+        return redisTemplate.opsForStream()
+                .range(properties.dlqStreamKey(), org.springframework.data.domain.Range.unbounded())
+                .get(0)
+                .getValue()
+                .get("originalMessageId")
+                .toString();
     }
 
     private interface ThrowingHandler {

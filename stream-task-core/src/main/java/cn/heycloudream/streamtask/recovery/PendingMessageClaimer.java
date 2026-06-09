@@ -1,6 +1,11 @@
 package cn.heycloudream.streamtask.recovery;
 
 import cn.heycloudream.streamtask.support.StreamTaskProperties;
+import io.lettuce.core.Consumer;
+import io.lettuce.core.StreamMessage;
+import io.lettuce.core.XAutoClaimArgs;
+import io.lettuce.core.api.async.RedisStreamAsyncCommands;
+import io.lettuce.core.models.stream.ClaimedMessages;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
@@ -19,46 +24,40 @@ public class PendingMessageClaimer {
         this.properties = properties;
     }
 
-    public List<ClaimedStreamRecord> autoClaim(String consumerName) {
-        return redisTemplate.execute((RedisCallback<List<ClaimedStreamRecord>>) connection -> {
-            Object raw = connection.execute("XAUTOCLAIM",
-                    bytes(properties.mainStreamKey()),
-                    bytes(properties.getGroup()),
-                    bytes(consumerName),
-                    bytes(String.valueOf(properties.getRecovery().getMinIdleTime().toMillis())),
-                    bytes("0-0"),
-                    bytes("COUNT"),
-                    bytes(String.valueOf(properties.getRecovery().getClaimBatchSize()))
-            );
-            return parse(raw);
+    public AutoClaimResult autoClaim(String consumerName, String startId) {
+        return redisTemplate.execute((RedisCallback<AutoClaimResult>) connection -> {
+            Object nativeConnection = connection.getNativeConnection();
+            if (!(nativeConnection instanceof RedisStreamAsyncCommands<?, ?> streamCommands)) {
+                throw new IllegalStateException("XAUTOCLAIM requires Lettuce RedisStreamAsyncCommands");
+            }
+            @SuppressWarnings("unchecked")
+            RedisStreamAsyncCommands<byte[], byte[]> commands =
+                    (RedisStreamAsyncCommands<byte[], byte[]>) streamCommands;
+            XAutoClaimArgs<byte[]> args = new XAutoClaimArgs<byte[]>()
+                    .consumer(Consumer.from(bytes(properties.getGroup()), bytes(consumerName)))
+                    .minIdleTime(properties.getRecovery().getMinIdleTime())
+                    .startId(startId)
+                    .count(properties.getRecovery().getClaimBatchSize());
+            try {
+                return fromClaimedMessages(commands.xautoclaim(bytes(properties.mainStreamKey()), args).get());
+            } catch (Exception error) {
+                throw new IllegalStateException("XAUTOCLAIM failed", error);
+            }
         });
     }
 
-    private static List<ClaimedStreamRecord> parse(Object raw) {
-        if (!(raw instanceof List<?> root) || root.size() < 2 || !(root.get(1) instanceof List<?> entries)) {
-            return List.of();
+    private static AutoClaimResult fromClaimedMessages(ClaimedMessages<byte[], byte[]> claimed) {
+        if (claimed == null) {
+            return AutoClaimResult.empty();
         }
         List<ClaimedStreamRecord> records = new ArrayList<>();
-        for (Object item : entries) {
-            if (!(item instanceof List<?> entry) || entry.size() < 2) {
-                continue;
-            }
-            String messageId = text(entry.get(0));
-            Map<Object, Object> body = parseBody(entry.get(1));
+        for (StreamMessage<byte[], byte[]> message : claimed.getMessages()) {
+            Map<Object, Object> body = new LinkedHashMap<>();
+            message.getBody().forEach((key, value) -> body.put(text(key), text(value)));
+            String messageId = message.getId();
             records.add(new ClaimedStreamRecord(messageId, body));
         }
-        return records;
-    }
-
-    private static Map<Object, Object> parseBody(Object fields) {
-        Map<Object, Object> body = new LinkedHashMap<>();
-        if (!(fields instanceof List<?> values)) {
-            return body;
-        }
-        for (int i = 0; i + 1 < values.size(); i += 2) {
-            body.put(text(values.get(i)), text(values.get(i + 1)));
-        }
-        return body;
+        return new AutoClaimResult(claimed.getId(), records);
     }
 
     private static byte[] bytes(String value) {
