@@ -14,6 +14,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class StreamTaskConsumerLoop implements SmartLifecycle {
@@ -48,7 +49,21 @@ public class StreamTaskConsumerLoop implements SmartLifecycle {
     public void stop() {
         running.set(false);
         if (worker != null) {
-            worker.shutdownNow();
+            worker.shutdown();
+            try {
+                boolean terminated = worker.awaitTermination(
+                        properties.getConsumer().getShutdownTimeout().toMillis(),
+                        TimeUnit.MILLISECONDS
+                );
+                if (!terminated) {
+                    log.warn("[StreamTask] consumer loop did not stop within shutdownTimeout={}ms, forcing shutdown",
+                            properties.getConsumer().getShutdownTimeout().toMillis());
+                    worker.shutdownNow();
+                }
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                worker.shutdownNow();
+            }
         }
     }
 

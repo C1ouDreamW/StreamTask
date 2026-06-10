@@ -124,8 +124,8 @@ public class StreamTaskAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public LeaseWatchdog leaseWatchdog(IdempotentGuard guard, StreamTaskProperties properties) {
-        return new LeaseWatchdog(guard, properties);
+    public LeaseWatchdog leaseWatchdog(IdempotentGuard guard, StreamTaskProperties properties, StreamTaskMetrics metrics) {
+        return new LeaseWatchdog(guard, properties, metrics);
     }
 
     @Bean
@@ -186,10 +186,10 @@ public class StreamTaskAutoConfiguration {
             StringRedisTemplate redisTemplate,
             StreamTaskProperties properties,
             DeadLetterService deadLetterService,
-            StreamTaskTemplate streamTaskTemplate,
-            AttemptRepository attemptRepository
+            StreamTaskSerializer serializer,
+            StreamTaskEnvelopeValidator validator
     ) {
-        return new DeadLetterReplayService(redisTemplate, properties, deadLetterService, streamTaskTemplate, attemptRepository);
+        return new DeadLetterReplayService(redisTemplate, properties, deadLetterService, serializer, validator);
     }
 
     @Bean

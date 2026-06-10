@@ -32,6 +32,10 @@ public class StreamTaskProperties {
         return "stream-task:{" + namespace + "}:last-error";
     }
 
+    public String dlqReplayKey(String dlqMessageId) {
+        return "stream-task:{" + namespace + "}:dlq-replay:" + dlqMessageId;
+    }
+
     public String idempotentKey(String taskType, String businessKey) {
         return "stream-task:{" + namespace + "}:idem:" + taskType + ":" + businessKey;
     }
@@ -317,6 +321,7 @@ public class StreamTaskProperties {
 
     public static class Dlq {
         private long maxLen = 5000;
+        private Duration replayTtl = Duration.ofDays(7);
 
         public long getMaxLen() {
             return maxLen;
@@ -324,6 +329,14 @@ public class StreamTaskProperties {
 
         public void setMaxLen(long maxLen) {
             this.maxLen = maxLen;
+        }
+
+        public Duration getReplayTtl() {
+            return replayTtl;
+        }
+
+        public void setReplayTtl(Duration replayTtl) {
+            this.replayTtl = replayTtl;
         }
     }
 }

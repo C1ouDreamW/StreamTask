@@ -1,9 +1,13 @@
 package cn.heycloudream.streamtask;
 
 import cn.heycloudream.streamtask.consumer.ConsumerGroupInitializer;
+import cn.heycloudream.streamtask.consumer.StreamTaskConsumerLoop;
 import cn.heycloudream.streamtask.consumer.StreamTaskExecutor;
 import cn.heycloudream.streamtask.consumer.StreamTaskHandlerRegistry;
+import cn.heycloudream.streamtask.dlq.DeadLetterReplayService;
 import cn.heycloudream.streamtask.dlq.DeadLetterService;
+import cn.heycloudream.streamtask.idempotent.IdempotentGuard;
+import cn.heycloudream.streamtask.idempotent.Lease;
 import cn.heycloudream.streamtask.idempotent.RedisIdempotentGuard;
 import cn.heycloudream.streamtask.idempotent.LeaseWatchdog;
 import cn.heycloudream.streamtask.metrics.NoopStreamTaskMetrics;
@@ -22,6 +26,7 @@ import org.springframework.data.redis.connection.RedisStandaloneConfiguration;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.data.redis.connection.stream.Consumer;
 import org.springframework.data.redis.connection.stream.MapRecord;
+import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.data.redis.connection.stream.ReadOffset;
 import org.springframework.data.redis.connection.stream.StreamOffset;
 import org.springframework.data.redis.connection.stream.StreamReadOptions;
@@ -38,6 +43,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -205,6 +213,107 @@ class RedisStreamTaskIntegrationTest {
                 .isZero();
     }
 
+    @Test
+    void shouldReplayDeadLetterOnlyOnce() {
+        properties.getRetry().setMaxAttempts(1);
+        StreamTaskExecutor executor = executor(task -> {
+            throw new IllegalStateException("boom");
+        });
+        template.publish("demo.success", "replay-once", "{}");
+        executor.execute(readOne(), properties.getConsumer().getName());
+        String dlqMessageId = redisTemplate.opsForStream()
+                .range(properties.dlqStreamKey(), org.springframework.data.domain.Range.unbounded())
+                .get(0)
+                .getId()
+                .getValue();
+
+        DeadLetterService deadLetterService = new DeadLetterService(redisTemplate, properties, new NoopStreamTaskMetrics());
+        DeadLetterReplayService replayService = new DeadLetterReplayService(
+                redisTemplate,
+                properties,
+                deadLetterService,
+                serializer,
+                new StreamTaskEnvelopeValidator(256 * 1024)
+        );
+        RecordId first = replayService.replay(dlqMessageId);
+        RecordId second = replayService.replay(dlqMessageId);
+
+        assertThat(second).isEqualTo(first);
+        assertThat(redisTemplate.opsForStream().size(properties.mainStreamKey())).isEqualTo(2);
+        assertThat(redisTemplate.opsForValue().get(properties.dlqReplayKey(dlqMessageId))).isEqualTo(first.getValue());
+    }
+
+    @Test
+    void watchdogCancelsItselfWhenRenewFails() throws InterruptedException {
+        properties.getIdempotent().setRenewInterval(Duration.ofMillis(10));
+        CountDownLatch renewCalled = new CountDownLatch(1);
+        CountingMetrics metrics = new CountingMetrics();
+        IdempotentGuard guard = new IdempotentGuard() {
+            @Override
+            public Lease acquire(StreamTaskEnvelope task) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public boolean markDone(Lease lease) {
+                return false;
+            }
+
+            @Override
+            public boolean release(Lease lease) {
+                return false;
+            }
+
+            @Override
+            public boolean renew(Lease lease) {
+                renewCalled.countDown();
+                return false;
+            }
+        };
+        LeaseWatchdog watchdog = new LeaseWatchdog(guard, properties, metrics);
+
+        ScheduledFuture<?> future = watchdog.watch(new Lease("lease-key", "token", cn.heycloudream.streamtask.idempotent.LeaseStatus.ACQUIRED));
+
+        assertThat(renewCalled.await(1, TimeUnit.SECONDS)).isTrue();
+        Thread.sleep(50);
+        assertThat(future.isCancelled()).isTrue();
+        assertThat(metrics.leaseLostCount).hasValue(1);
+        watchdog.shutdown();
+    }
+
+    @Test
+    void streamMaxLenIsAppliedDuringPublish() {
+        properties.getStream().setMaxLen(2);
+        properties.getStream().setApproximateTrimming(false);
+
+        template.publish("demo.success", "trim-1", "{}");
+        template.publish("demo.success", "trim-2", "{}");
+        template.publish("demo.success", "trim-3", "{}");
+
+        assertThat(redisTemplate.opsForStream().size(properties.mainStreamKey())).isEqualTo(2);
+    }
+
+    @Test
+    void consumerLoopWaitsForShutdownTimeoutBeforeForcingStop() {
+        properties.getConsumer().setShutdownTimeout(Duration.ofMillis(120));
+        properties.getConsumer().setBlockTimeout(Duration.ofSeconds(1));
+        StreamTaskConsumerLoop loop = new StreamTaskConsumerLoop(redisTemplate, properties, executor(task -> {
+        }));
+        loop.start();
+        try {
+            Thread.sleep(50);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        long started = System.nanoTime();
+
+        loop.stop();
+
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+        assertThat(elapsedMillis).isGreaterThanOrEqualTo(100);
+        assertThat(loop.isRunning()).isFalse();
+    }
+
     private StreamTaskExecutor executor(ThrowingHandler handler) {
         AttemptRepository attemptRepository = new AttemptRepository(redisTemplate, properties);
         DeadLetterService deadLetterService = new DeadLetterService(redisTemplate, properties, new NoopStreamTaskMetrics());
@@ -217,7 +326,7 @@ class RedisStreamTaskIntegrationTest {
                 attemptRepository,
                 deadLetterService,
                 guard,
-                new LeaseWatchdog(guard, properties),
+                new LeaseWatchdog(guard, properties, new NoopStreamTaskMetrics()),
                 new NoopStreamTaskMetrics()
         );
     }
@@ -262,6 +371,15 @@ class RedisStreamTaskIntegrationTest {
         @Override
         public void handle(StreamTaskEnvelope task) throws Exception {
             delegate.handle(task);
+        }
+    }
+
+    private static class CountingMetrics extends NoopStreamTaskMetrics {
+        private final AtomicInteger leaseLostCount = new AtomicInteger();
+
+        @Override
+        public void leaseLost(String taskType) {
+            leaseLostCount.incrementAndGet();
         }
     }
 }
