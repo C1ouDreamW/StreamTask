@@ -1,5 +1,7 @@
 # StreamTask
 
+[![CI](https://github.com/C1ouDreamW/StreamTask/actions/workflows/ci.yml/badge.svg)](https://github.com/C1ouDreamW/StreamTask/actions/workflows/ci.yml)
+
 StreamTask 是一个基于 Redis Stream 的轻量级可靠异步任务组件，通过 Spring Boot Starter 提供任务发布、消费者组消费、手动确认、失败重试、死信队列、Pending 恢复、幂等保护和基础可观测性。
 
 ## 可靠性语义
