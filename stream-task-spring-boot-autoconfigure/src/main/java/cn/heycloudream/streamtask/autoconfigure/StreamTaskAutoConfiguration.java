@@ -24,6 +24,7 @@ import cn.heycloudream.streamtask.support.StreamTaskEnvelopeValidator;
 import cn.heycloudream.streamtask.support.StreamTaskProperties;
 import cn.heycloudream.streamtask.support.StreamTaskSerializer;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
@@ -52,7 +53,9 @@ public class StreamTaskAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean
     public ObjectMapper streamTaskObjectMapper() {
-        return new ObjectMapper();
+        return new ObjectMapper()
+                .findAndRegisterModules()
+                .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
     }
 
     @Bean
